@@ -2,6 +2,7 @@
 /** @import { HydratableContext, SSRContext } from './types.js' */
 /** @import { Csp, RenderOutput, SyncRenderOutput, Sha256Source } from '../../server/public.js' */
 /** @import { MaybePromise } from '#shared' */
+import { DEV } from 'esm-env';
 import { async_mode_flag } from '../flags/index.js';
 import { STALE_REACTION } from '../client/constants.js';
 import { pop, push, set_ssr_context, ssr_context } from './context.js';
@@ -22,6 +23,9 @@ import { escape_html } from '../../escaping.js';
 /**
  * @typedef {string | Renderer} RendererItem
  */
+
+/** Shared, so a render that never sets a title allocates nothing */
+const NO_TITLE = /** @type {number[]} */ ([]);
 
 class RenderResult {
 	/** @type {() => AccumulatedContent} */
@@ -195,7 +199,9 @@ export class Renderer {
 		this.#parent = parent;
 
 		this.global = global;
-		this.local = parent ? { ...parent.local } : { select_value: undefined, multiple: false };
+		this.local = parent
+			? { select_value: parent.local.select_value, multiple: parent.local.multiple }
+			: { select_value: undefined, multiple: false };
 		this.type = parent ? parent.type : 'body';
 	}
 
@@ -303,14 +309,7 @@ export class Renderer {
 		this.#out.push(child);
 
 		const parent = ssr_context;
-
-		set_ssr_context({
-			...ssr_context,
-			p: parent,
-			c: null,
-			r: child,
-			i: ssr_context?.i ?? false
-		});
+		set_ssr_context(child_context(parent, child));
 
 		const result = fn(child);
 
@@ -356,13 +355,7 @@ export class Renderer {
 			};
 		}
 
-		set_ssr_context({
-			...ssr_context,
-			p: parent_context,
-			c: null,
-			r: child,
-			i: ssr_context?.i ?? false
-		});
+		set_ssr_context(child_context(parent_context, child));
 
 		try {
 			const result = children_fn(child);
@@ -941,16 +934,9 @@ export class Renderer {
 	 * @returns {AccumulatedContent & { hashes: { script: Sha256Source[] } }}
 	 */
 	static #close_render(content, renderer) {
-		let head = content.head + renderer.global.get_title();
-		let body = content.body;
-
-		for (const { hash, code } of renderer.global.css) {
-			head += `<style id="${hash}">${code}</style>`;
-		}
-
 		return {
-			head,
-			body,
+			head: content.head + renderer.global.get_title() + renderer.global.get_styles(),
+			body: content.body,
 			hashes: {
 				script: renderer.global.csp.script_hashes
 			}
@@ -1018,14 +1004,17 @@ export class SSRState {
 	/** @readonly @type {'sync' | 'async'} */
 	mode;
 
-	/** @readonly @type {() => string} */
-	uid;
+	/**
+	 * Stylesheets added during this render. Most renders add none, so the set is created on first use.
+	 * @type {Set<{ hash: string; code: string }> | null}
+	 */
+	#css = null;
 
-	/** @readonly @type {Set<{ hash: string; code: string }>} */
-	css = new Set();
-
-	/** @type {Set<Promise<unknown>>} */
-	#pending = new Set();
+	/**
+	 * Promises still running. Only async renders have any, so the set is created on first use.
+	 * @type {Set<Promise<unknown>> | null}
+	 */
+	#pending = null;
 
 	/** @type {AbortController | null} */
 	#controller = null;
@@ -1039,8 +1028,18 @@ export class SSRState {
 	 */
 	transformError;
 
-	/** @type {{ path: number[], value: string }} */
-	#title = { path: [], value: '' };
+	/** @type {string} */
+	#id_prefix;
+
+	#next_uid = 1;
+
+	/**
+	 * Path of the renderer that set the current title
+	 * @type {number[]}
+	 */
+	#title_path = NO_TITLE;
+
+	#title_value = '';
 
 	/**
 	 * @param {'sync' | 'async'} mode
@@ -1051,15 +1050,34 @@ export class SSRState {
 	constructor(mode, id_prefix = '', csp = { hash: false }, transformError) {
 		this.mode = mode;
 		this.csp = { ...csp, script_hashes: [] };
+		this.transformError = transformError ?? rethrow;
+		this.#id_prefix = id_prefix;
+	}
 
-		this.transformError =
-			transformError ??
-			((error) => {
-				throw error;
-			});
+	/** @returns {Set<{ hash: string; code: string }>} */
+	get css() {
+		return (this.#css ??= new Set());
+	}
 
-		let uid = 1;
-		this.uid = () => `${id_prefix}s${uid++}`;
+	/**
+	 * The `<style>` elements for every stylesheet added during this render
+	 * @returns {string}
+	 */
+	get_styles() {
+		if (this.#css === null) return '';
+
+		let styles = '';
+
+		for (const { hash, code } of this.#css) {
+			styles += `<style id="${hash}">${code}</style>`;
+		}
+
+		return styles;
+	}
+
+	/** @returns {string} */
+	uid() {
+		return `${this.#id_prefix}s${this.#next_uid++}`;
 	}
 
 	/**
@@ -1068,16 +1086,18 @@ export class SSRState {
 	 * @returns {Promise<T>}
 	 */
 	track(promise) {
-		this.#pending.add(promise);
+		const pending = (this.#pending ??= new Set());
+
+		pending.add(promise);
 		promise.then(
-			() => this.#pending.delete(promise),
-			() => this.#pending.delete(promise)
+			() => pending.delete(promise),
+			() => pending.delete(promise)
 		);
 		return promise;
 	}
 
 	async settle() {
-		while (this.#pending.size > 0) {
+		while (this.#pending !== null && this.#pending.size > 0) {
 			await Promise.allSettled([...this.#pending]);
 		}
 	}
@@ -1095,7 +1115,7 @@ export class SSRState {
 	}
 
 	get_title() {
-		return this.#title.value;
+		return this.#title_value;
 	}
 
 	/**
@@ -1105,10 +1125,10 @@ export class SSRState {
 	 * @param {number[]} path
 	 */
 	set_title(value, path) {
-		const current = this.#title.path;
+		const current = this.#title_path;
+		const l = Math.min(path.length, current.length);
 
 		let i = 0;
-		let l = Math.min(path.length, current.length);
 
 		// skip identical prefixes - [1, 2, 3, ...] === [1, 2, 3, ...]
 		while (i < l && path[i] === current[i]) i += 1;
@@ -1116,11 +1136,35 @@ export class SSRState {
 		if (path[i] === undefined) return;
 
 		// replace title if
+		// - no title was set yet
 		// - incoming path is longer - [7, 8, 9] > [7, 8]
 		// - incoming path is later  - [7, 8, 9] > [7, 8, 8]
 		if (current[i] === undefined || path[i] > current[i]) {
-			this.#title.path = path;
-			this.#title.value = value;
+			this.#title_path = path;
+			this.#title_value = value;
 		}
 	}
+}
+
+/** @param {unknown} error */
+function rethrow(error) {
+	throw error;
+}
+
+/**
+ * The context a child renderer runs in: the parent's component context, but the new renderer
+ * @param {SSRContext | null} parent
+ * @param {Renderer} renderer
+ * @returns {SSRContext}
+ */
+function child_context(parent, renderer) {
+	/** @type {SSRContext} */
+	const context = { p: parent, c: null, r: renderer, i: parent !== null && parent.i };
+
+	if (DEV && parent !== null) {
+		context.function = parent.function;
+		context.element = parent.element;
+	}
+
+	return context;
 }

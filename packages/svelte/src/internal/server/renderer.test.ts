@@ -159,6 +159,35 @@ test('SSRState uid generator uses prefix', () => {
 	expect(state.uid()).toBe('id-s1');
 });
 
+test('SSRState creates the css set on first use and renders it as style tags', () => {
+	const state = new SSRState('sync');
+	expect(state.get_styles()).toBe('');
+
+	state.css.add({ hash: 'h1', code: 'a{}' });
+	expect(state.css).toBe(state.css);
+	state.css.add({ hash: 'h2', code: 'b{}' });
+
+	expect(state.get_styles()).toBe('<style id="h1">a{}</style><style id="h2">b{}</style>');
+});
+
+test('SSRState settles immediately when nothing was tracked', async () => {
+	const state = new SSRState('async');
+	await expect(state.settle()).resolves.toBeUndefined();
+
+	let resolve = () => {};
+	const promise = new Promise<void>((f) => (resolve = f));
+	state.track(promise);
+
+	let settled = false;
+	const settling = state.settle().then(() => (settled = true));
+	await Promise.resolve();
+	expect(settled).toBe(false);
+
+	resolve();
+	await settling;
+	expect(settled).toBe(true);
+});
+
 test('SSRState title ordering favors later lexicographic paths', () => {
 	const state = new SSRState('sync');
 
