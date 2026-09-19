@@ -1,19 +1,21 @@
 import { escape_html } from '../../escaping.js';
 import { clsx as _clsx } from 'clsx';
-import { has_own_property } from './utils.js';
 
 /**
  * `<div translate={false}>` should be rendered as `<div translate="no">` and _not_
  * `<div translate="false">`, which is equivalent to `<div translate="yes">`. There
  * may be other odd cases that need to be added to this list in future
- * @type {Record<string, Map<any, string>>}
+ * @type {Map<string, Map<any, string>>}
  */
-const replacements = {
-	translate: new Map([
-		[true, 'yes'],
-		[false, 'no']
-	])
-};
+const replacements = new Map([
+	[
+		'translate',
+		new Map([
+			[true, 'yes'],
+			[false, 'no']
+		])
+	]
+]);
 
 /**
  * @template V
@@ -29,10 +31,12 @@ export function attr(name, value, is_boolean = false) {
 	}
 	// `''` is a present boolean attribute, as it is in markup and on the client
 	if (value == null || (is_boolean && !value && value !== '')) return '';
-	const normalized =
-		(has_own_property.call(replacements, name) && replacements[name].get(value)) || value;
-	const assignment = is_boolean ? `=""` : `="${escape_html(normalized, true)}"`;
-	return ` ${name}${assignment}`;
+	if (is_boolean) return ` ${name}=""`;
+
+	const replacement = replacements.get(name);
+	const normalized = (replacement !== undefined && replacement.get(value)) || value;
+
+	return ` ${name}="${escape_html(normalized, true)}"`;
 }
 
 /**

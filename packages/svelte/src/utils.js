@@ -175,12 +175,16 @@ const DOM_BOOLEAN_ATTRIBUTES = [
 	'disableremoteplayback'
 ];
 
+// `attributes()` asks this for every attribute of every spread, and a linear scan is
+// 29 string compares. marked pure so bundlers can drop it when unused
+const DOM_BOOLEAN_ATTRIBUTE_SET = /*#__PURE__*/ new Set(DOM_BOOLEAN_ATTRIBUTES);
+
 /**
  * Returns `true` if `name` is a boolean attribute
  * @param {string} name
  */
 export function is_boolean_attribute(name) {
-	return DOM_BOOLEAN_ATTRIBUTES.includes(name);
+	return DOM_BOOLEAN_ATTRIBUTE_SET.has(name);
 }
 
 /**
