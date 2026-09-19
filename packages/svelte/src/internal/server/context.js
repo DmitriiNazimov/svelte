@@ -1,6 +1,6 @@
 /** @import { SSRContext } from '#server' */
 import { DEV } from 'esm-env';
-import { create_context, get_or_init_context_map } from '../shared/context.js';
+import { create_context, get_context_map, get_or_init_context_map } from '../shared/context.js';
 import * as e from './errors.js';
 
 /** @type {SSRContext | null} */
@@ -28,10 +28,9 @@ export function createContext() {
  * @returns {T}
  */
 export function getContext(key) {
-	const context_map = get_or_init_context_map(ssr_context, 'getContext');
-	const result = /** @type {T} */ (context_map.get(key));
+	const context_map = get_context_map(ssr_context, 'getContext');
 
-	return result;
+	return /** @type {T} */ (context_map === null ? undefined : context_map.get(key));
 }
 
 /**
@@ -56,7 +55,9 @@ export function setContext(key, context) {
  * @returns {boolean}
  */
 export function hasContext(key) {
-	return get_or_init_context_map(ssr_context, 'hasContext').has(key);
+	const context_map = get_context_map(ssr_context, 'hasContext');
+
+	return context_map !== null && context_map.has(key);
 }
 
 /** @returns {Map<any, any>} */

@@ -28,18 +28,36 @@ export function create_context(get_context, set_context, has_context) {
  */
 
 /**
- * @param {Context} context
+ * Finds the nearest context map, starting with `context` itself, without creating one.
+ * Returns `null` if no component up the tree has set context.
+ * @param {Context | null} context
  * @returns {Map<unknown, unknown> | null}
  */
-function get_parent_context(context) {
-	let parent = context.p;
-	while (parent !== null && parent.c === null) {
-		parent = parent.p;
+function find_context_map(context) {
+	while (context !== null && context.c === null) {
+		context = context.p;
 	}
-	return parent?.c ?? null;
+	return context === null ? null : context.c;
 }
 
 /**
+ * For reads (`getContext`, `hasContext`): the nearest context map, or `null`.
+ * Reading does not need an own copy of the parent map, so none is created.
+ * @param {Context | null} context
+ * @param {string} name
+ * @returns {Map<unknown, unknown> | null}
+ */
+export function get_context_map(context, name) {
+	if (context === null) {
+		lifecycle_outside_component(name);
+	}
+
+	return find_context_map(context);
+}
+
+/**
+ * For writes (`setContext`) and for handing the map out (`getAllContexts`): the
+ * component's own context map, created as a copy of the parent map if needed.
  * @param {Context | null} context
  * @param {string} name
  * @returns {Map<unknown, unknown>}
@@ -49,5 +67,5 @@ export function get_or_init_context_map(context, name) {
 		lifecycle_outside_component(name);
 	}
 
-	return (context.c ??= new Map(get_parent_context(context) || undefined));
+	return (context.c ??= new Map(find_context_map(context.p) || undefined));
 }
