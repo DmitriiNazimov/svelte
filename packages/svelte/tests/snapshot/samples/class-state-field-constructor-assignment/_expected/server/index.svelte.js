@@ -1,7 +1,9 @@
 import * as $ from 'svelte/internal/server';
 
 export default function Class_state_field_constructor_assignment($$renderer, $$props) {
-	$$renderer.component(($$renderer) => {
+	$.push($$renderer);
+
+	try {
 		class Foo {
 			a = 0;
 			#b;
@@ -32,5 +34,7 @@ export default function Class_state_field_constructor_assignment($$renderer, $$p
 				this.bar = 4;
 			}
 		}
-	});
+	} finally {
+		$.pop();
+	}
 }

@@ -170,6 +170,12 @@ export class Renderer {
 	#offset = 0;
 
 	/**
+	 * How many `onDestroy` groups were closed when a legacy `bind:` retry loop started,
+	 * so a retry can drop the groups of the attempt it throws away. `-1` outside a loop.
+	 */
+	#retry_done = -1;
+
+	/**
 	 * Asynchronous work associated with this renderer
 	 * @type {Promise<void> | undefined}
 	 */
@@ -303,9 +309,11 @@ export class Renderer {
 	 * Create a child renderer. The child renderer inherits the state from the parent,
 	 * but has its own content.
 	 * @param {(renderer: Renderer) => MaybePromise<void>} fn
+	 * @param {boolean} [is_component_body] see {@link component}
 	 */
-	child(fn) {
+	child(fn, is_component_body = false) {
 		const child = new Renderer(this.global, this);
+		child.#is_component_body = is_component_body;
 		this.#out.push(child);
 
 		const parent = ssr_context;
@@ -357,6 +365,13 @@ export class Renderer {
 
 		set_ssr_context(child_context(parent_context, child));
 
+		// sync mode: remember the `onDestroy` state, so callbacks registered by content
+		// that gets discarded below are discarded with it, as they are in async mode
+		const global = this.global;
+		const done_length = global.on_destroy_done === null ? 0 : global.on_destroy_done.length;
+		const group = global.on_destroy_group;
+		const group_length = group === null ? 0 : group.length;
+
 		try {
 			const result = children_fn(child);
 
@@ -381,6 +396,13 @@ export class Renderer {
 
 			child.#out.length = 0;
 			child.#boundary = null;
+			child.#on_destroy = undefined;
+
+			if (global.mode === 'sync') {
+				if (global.on_destroy_done !== null) global.on_destroy_done.length = done_length;
+				if (group === null) global.on_destroy_group = null;
+				else group.length = group_length;
+			}
 
 			if (result instanceof Promise) {
 				if (this.global.mode === 'sync') {
@@ -412,13 +434,29 @@ export class Renderer {
 	 * @returns {void}
 	 */
 	component(fn, component_fn) {
-		push(component_fn);
-		// mark before running so `onDestroy` callbacks are still collected if `fn` throws
-		this.child((renderer) => {
-			renderer.#is_component_body = true;
-			return fn(renderer);
-		});
-		pop();
+		if (this.global.mode === 'async') {
+			push(null, component_fn);
+			// mark before running so `onDestroy` callbacks are still collected if `fn` throws
+			this.child(fn, true);
+			pop();
+			return;
+		}
+
+		// nothing can suspend in sync mode, so the body writes into this renderer instead of
+		// a child. `onDestroy` callbacks are grouped per component, and groups close deepest
+		// component first, which is the order the renderer tree gives in async mode
+		push(this, component_fn);
+
+		try {
+			const result = fn(this);
+
+			if (result instanceof Promise) {
+				result.catch(noop);
+				e.await_invalid();
+			}
+		} finally {
+			pop();
+		}
 	}
 
 	/**
@@ -546,7 +584,11 @@ export class Renderer {
 	 * @param {() => void} fn
 	 */
 	on_destroy(fn) {
-		(this.#on_destroy ??= []).push(fn);
+		if (this.global.mode === 'sync') {
+			(this.global.on_destroy_group ??= []).push(fn);
+		} else {
+			(this.#on_destroy ??= []).push(fn);
+		}
 	}
 
 	/**
@@ -572,6 +614,17 @@ export class Renderer {
 			// stay in place and the copy starts empty. Copying it would be O(page) per retry
 			copy.#appends_to = this;
 			copy.#offset = this.#offset + this.#out.length;
+
+			// a retry throws the previous attempt away, and with it the callbacks
+			// its components registered, the way the async path throws away the copy
+			const done = this.global.on_destroy_done;
+
+			if (this.#retry_done === -1) {
+				this.#retry_done = done === null ? 0 : done.length;
+			} else if (done !== null) {
+				done.length = this.#retry_done;
+			}
+
 			return copy;
 		}
 
@@ -594,8 +647,15 @@ export class Renderer {
 		this.local = other.local;
 
 		if (other.#appends_to === this) {
+			this.#retry_done = -1;
 			for (const item of other.#out) this.#out.push(item);
 		} else {
+			// a component compiled without `experimental.async` registers its callbacks on
+			// the renderer it was given, which in a retry loop is the copy
+			if (other.#on_destroy !== undefined) {
+				(this.#on_destroy ??= []).push(...other.#on_destroy);
+			}
+
 			this.#out = other.#out.map((item, i) => {
 				const current = this.#out[i];
 
@@ -662,9 +722,24 @@ export class Renderer {
 	 * @returns {Iterable<() => void>}
 	 */
 	*#collect_on_destroy() {
+		if (this.global.mode === 'sync') {
+			// groups closed deepest component first, see `component`. The last open group
+			// belongs to the root, which has no `component` frame of its own
+			const done = this.global.on_destroy_done;
+			if (done !== null) for (const group of done) yield* group;
+			const root = this.global.on_destroy_group;
+			if (root !== null) yield* root;
+			return;
+		}
+
 		for (const component of this.#traverse_components()) {
 			yield* component.#collect_ondestroy();
 		}
+
+		// a component compiled without `experimental.async` has no frame of its own in the
+		// tree, so its callbacks sit on the renderer it wrote into. the root is never a
+		// component body, and `#traverse_components` skips it
+		if (!this.#is_component_body) yield* this.#collect_ondestroy();
 	}
 
 	/**
@@ -916,7 +991,7 @@ export class Renderer {
 
 		try {
 			/** @type {SSRContext} */
-			const context = { p: null, c: options.context ?? null, r: renderer, i: false };
+			const context = { p: null, c: options.context ?? null, r: renderer, i: false, d: null };
 			set_ssr_context(context);
 
 			renderer.push(BLOCK_OPEN);
@@ -1042,6 +1117,16 @@ export class SSRState {
 	#title_value = '';
 
 	/**
+	 * Sync mode only: `onDestroy` callbacks of the component rendering right now, and the
+	 * groups of the components that finished, deepest first. See {@link Renderer.component}
+	 * @type {(() => void)[] | null}
+	 */
+	on_destroy_group = null;
+
+	/** @type {(() => void)[][] | null} */
+	on_destroy_done = null;
+
+	/**
 	 * @param {'sync' | 'async'} mode
 	 * @param {string} id_prefix
 	 * @param {Csp} csp
@@ -1159,7 +1244,7 @@ function rethrow(error) {
  */
 function child_context(parent, renderer) {
 	/** @type {SSRContext} */
-	const context = { p: parent, c: null, r: renderer, i: parent !== null && parent.i };
+	const context = { p: parent, c: null, r: renderer, i: parent !== null && parent.i, d: null };
 
 	if (DEV && parent !== null) {
 		context.function = parent.function;

@@ -1,7 +1,9 @@
 import * as $ from 'svelte/internal/server';
 
 export default function Props_identifier($$renderer, $$props) {
-	$$renderer.component(($$renderer) => {
+	$.push($$renderer);
+
+	try {
 		let { $$slots, $$events, ...props } = $$props;
 
 		props.a;
@@ -11,5 +13,7 @@ export default function Props_identifier($$renderer, $$props) {
 		props.a = true;
 		props[a] = true;
 		props;
-	});
+	} finally {
+		$.pop();
+	}
 }

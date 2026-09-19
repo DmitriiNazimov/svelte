@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { Renderer, SSRState } from './renderer.js';
+import { pop, push } from './context.js';
 import type { Component } from 'svelte';
 import { disable_async_mode_flag, enable_async_mode_flag } from '../flags/index.js';
 import { getAbortSignal } from './abort-signal.js';
@@ -152,6 +153,114 @@ test('subsume refuses to switch modes', () => {
 	expect(() => a.subsume(b)).toThrow(
 		"invariant: A renderer cannot switch modes. If you're seeing this, there's a compiler bug. File an issue!"
 	);
+});
+
+/**
+ * The shape the compiler emits for a component whose body contains a legacy `bind:`:
+ * the body is rendered into a copy until the bound values settle, and only the last
+ * attempt is subsumed. See `create_child_block` and `uses_component_bindings`.
+ */
+function render_with_retries(
+	renderer: Renderer,
+	attempts: number,
+	body: (renderer: Renderer) => void
+) {
+	let inner: Renderer;
+	let seen = 0;
+
+	do {
+		inner = renderer.copy();
+		body(inner);
+	} while (++seen < attempts);
+
+	renderer.subsume(inner!);
+}
+
+/** A component frame, as `$.push(...)` / `$.pop()` in the compiled output. */
+function component(renderer: Renderer, body: () => void) {
+	push(renderer);
+
+	try {
+		body();
+	} finally {
+		pop();
+	}
+}
+
+test('a discarded `bind:` attempt does not keep its onDestroy callbacks', () => {
+	const logs: string[] = [];
+
+	const parent = (renderer: Renderer) => {
+		component(renderer, () => {
+			renderer.on_destroy(() => logs.push('parent'));
+
+			render_with_retries(renderer, 2, (inner) => {
+				component(inner, () => {
+					inner.on_destroy(() => logs.push('child'));
+					inner.push('a');
+				});
+				component(inner, () => {
+					inner.on_destroy(() => logs.push('sibling'));
+					inner.push('b');
+				});
+			});
+		});
+	};
+
+	const { body } = Renderer.render(parent as unknown as Component);
+
+	expect(body).toBe('<!--[-->ab<!--]-->');
+	expect(logs).toEqual(['child', 'sibling', 'parent']);
+});
+
+test('nested `bind:` retries keep one set of onDestroy callbacks', () => {
+	const logs: string[] = [];
+
+	const root = (renderer: Renderer) => {
+		component(renderer, () => {
+			renderer.on_destroy(() => logs.push('root'));
+
+			render_with_retries(renderer, 2, (outer) => {
+				component(outer, () => {
+					outer.on_destroy(() => logs.push('middle'));
+
+					render_with_retries(outer, 2, (inner) => {
+						component(inner, () => {
+							inner.on_destroy(() => logs.push('leaf'));
+							inner.push('x');
+						});
+					});
+				});
+			});
+		});
+	};
+
+	const { body } = Renderer.render(root as unknown as Component);
+
+	expect(body).toBe('<!--[-->x<!--]-->');
+	expect(logs).toEqual(['leaf', 'middle', 'root']);
+});
+
+test('two sibling `bind:` components keep both sets of onDestroy callbacks', () => {
+	const logs: string[] = [];
+
+	const parent = (renderer: Renderer) => {
+		for (const name of ['first', 'second']) {
+			component(renderer, () => {
+				render_with_retries(renderer, 2, (inner) => {
+					component(inner, () => {
+						inner.on_destroy(() => logs.push(name));
+						inner.push(name[0]);
+					});
+				});
+			});
+		}
+	};
+
+	const { body } = Renderer.render(parent as unknown as Component);
+
+	expect(body).toBe('<!--[-->fs<!--]-->');
+	expect(logs).toEqual(['first', 'second']);
 });
 
 test('SSRState uid generator uses prefix', () => {
@@ -505,6 +614,51 @@ describe('async', () => {
 
 		await Renderer.render(component as unknown as Component);
 		expect(destroyed).toEqual(['c', 'e', 'a', 'b', 'b*', 'd']);
+	});
+
+	// a component compiled without `experimental.async` calls `push`/`pop` and registers
+	// its callbacks on the renderer it was given, even when the render is async
+	test('a component compiled without async keeps its callbacks through a `bind:` retry', async () => {
+		const logs: string[] = [];
+
+		const parent = (renderer: Renderer) => {
+			component(renderer, () => {
+				renderer.on_destroy(() => logs.push('parent'));
+
+				render_with_retries(renderer, 2, (inner) => {
+					component(inner, () => {
+						inner.on_destroy(() => logs.push('child'));
+						inner.push('a');
+					});
+				});
+			});
+		};
+
+		const { body } = await Renderer.render(parent as unknown as Component);
+
+		expect(body).toBe('<!--[-->a<!--]-->');
+		expect(logs).toEqual(['parent', 'child']);
+	});
+
+	test('a failed boundary discards the callbacks of a component compiled without async', async () => {
+		const logs: string[] = [];
+
+		const parent = (renderer: Renderer) => {
+			component(renderer, () => {
+				renderer.on_destroy(() => logs.push('parent'));
+
+				renderer.boundary({ failed: () => {} }, (child) => {
+					component(child, () => {
+						child.on_destroy(() => logs.push('inside'));
+					});
+					throw new Error('boom');
+				});
+			});
+		};
+
+		await Renderer.render(parent as unknown as Component, { transformError: () => 'e' } as any);
+
+		expect(logs).toEqual(['parent']);
 	});
 
 	test('on_destroy callbacks run when a sync render throws', () => {

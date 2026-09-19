@@ -271,15 +271,29 @@ export function server_component(analysis, options) {
 	let should_inject_context = dev || analysis.needs_context || defer_store_teardown;
 
 	if (should_inject_context) {
-		component_block = b.block([
-			b.stmt(
-				b.call(
-					'$$renderer.component',
-					b.arrow([b.id('$$renderer')], component_block, false),
-					dev && b.id(component_name)
-				)
-			)
-		]);
+		component_block = b.block(
+			options.experimental.async
+				? [
+						b.stmt(
+							b.call(
+								'$$renderer.component',
+								b.arrow([b.id('$$renderer')], component_block, false),
+								dev && b.id(component_name)
+							)
+						)
+					]
+				: [
+						// nothing can suspend without `experimental.async`, so the body does not need a
+						// renderer of its own. inlining it here saves a closure per component
+						b.stmt(b.call('$.push', b.id('$$renderer'), dev && b.id(component_name))),
+						{
+							type: 'TryStatement',
+							block: component_block,
+							handler: null,
+							finalizer: b.block([b.stmt(b.call('$.pop'))])
+						}
+					]
+		);
 	}
 
 	if (analysis.uses_rest_props) {

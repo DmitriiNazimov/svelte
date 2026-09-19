@@ -11,6 +11,8 @@ export interface SSRContext {
 	r: null | Renderer;
 	/** True if initialized, i.e. an `await` was reached */
 	i: boolean;
+	/** the `onDestroy` group the enclosing component was collecting into */
+	d: null | (() => void)[];
 	/** dev mode only: the current component function */
 	function?: any;
 	/** dev mode only: the current element */
