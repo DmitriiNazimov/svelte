@@ -195,10 +195,16 @@ export function spread_props(props) {
 		if (obj == null) continue;
 		for (key of Object.keys(obj)) {
 			const desc = Object.getOwnPropertyDescriptor(obj, key);
-			if (desc) {
-				Object.defineProperty(merged_props, key, desc);
-			} else {
+
+			// a plain store is much cheaper, but it only makes default flags, and it goes
+			// through whatever the key already is, here or on the prototype: an accessor,
+			// a read-only property, or `__proto__`
+			if (desc === undefined) {
 				merged_props[key] = obj[key];
+			} else if (desc.writable && desc.configurable && !(key in merged_props)) {
+				merged_props[key] = desc.value;
+			} else {
+				Object.defineProperty(merged_props, key, desc);
 			}
 		}
 	}
